@@ -16,7 +16,6 @@ require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const compression = require('compression');
@@ -44,61 +43,12 @@ const server = http.createServer(app);
 const isDev = process.env.NODE_ENV === 'development';
 
 /* =========================================================
-   CORS CONFIG
-   ========================================================= */
-
-// FRONTEND_URL can be comma-separated in Railway:
-// FRONTEND_URL=http://localhost:5173,http://localhost,capacitor://localhost
-const envOrigins = (process.env.FRONTEND_URL || '')
-  .split(',')
-  .map((o) => o.trim())
-  .filter(Boolean);
-
-const defaultOrigins = [
-  'http://localhost:5173',
-  'http://localhost:3000',
-  'http://localhost:5000',
-  'http://localhost',
-  'capacitor://localhost',
-  'ionic://localhost',
-  'https://tradeaxis-cf3.pages.dev',
-];
-
-const ALLOWED_ORIGINS = Array.from(new Set([...defaultOrigins, ...envOrigins]));
-
-const isAllowedOrigin = (origin) => {
-  if (!origin) return true; // mobile apps, curl, postman
-  return ALLOWED_ORIGINS.includes(origin);
-};
-
-const corsOptions = {
-  origin: (origin, callback) => {
-    if (isAllowedOrigin(origin)) {
-      return callback(null, true);
-    }
-
-    console.log('❌ Blocked by CORS:', origin);
-    return callback(new Error(`Not allowed by CORS: ${origin}`));
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-};
-
-/* =========================================================
    SOCKET.IO
    ========================================================= */
 
 const io = new Server(server, {
   cors: {
-    origin: (origin, callback) => {
-      if (isAllowedOrigin(origin)) {
-        return callback(null, true);
-      }
-
-      console.log('❌ Socket blocked by CORS:', origin);
-      return callback(new Error(`Socket not allowed by CORS: ${origin}`));
-    },
+    origin: true,
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -122,8 +72,28 @@ app.use(
   })
 );
 
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+// ✅ Open CORS for APK / Capacitor / WebView / browser testing
+app.use((req, res, next) => {
+  const origin = req.headers.origin || '*';
+
+  res.header('Access-Control-Allow-Origin', origin);
+  res.header('Vary', 'Origin');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header(
+    'Access-Control-Allow-Headers',
+    'Origin, X-Requested-With, Content-Type, Accept, Authorization'
+  );
+  res.header(
+    'Access-Control-Allow-Methods',
+    'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+  );
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
 
 app.use(express.json({ limit: '10mb' }));
 app.use(compression());
@@ -180,7 +150,7 @@ app.get('/api', (req, res) => {
       trading: '/api/trading',
       watchlists: '/api/watchlists',
     },
-    allowedOrigins: ALLOWED_ORIGINS,
+    cors: 'open',
   });
 });
 
@@ -222,7 +192,7 @@ const startServer = async () => {
     console.log(`   📍 HTTP: http://0.0.0.0:${PORT}`);
     console.log(`   ⚡ WS : ws://0.0.0.0:${PORT}`);
     console.log(`   🌍 ENV: ${process.env.NODE_ENV}`);
-    console.log(`   ✅ Allowed Origins: ${ALLOWED_ORIGINS.join(', ')}`);
+    console.log('   ✅ CORS: open (origin: true)');
     console.log('══════════════════════════════════════════════════════════════');
     console.log('');
 
