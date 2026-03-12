@@ -1,8 +1,5 @@
 {
-<<<<<<< HEAD
-=======
   "$schema": "https://railway.app/railway.schema.json",
->>>>>>> b848ecd (fixed railway dackend deployment)
   "build": {
     "builder": "NIXPACKS"
   },
@@ -11,8 +8,4 @@
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 3
   }
-<<<<<<< HEAD
 }
-=======
-}
->>>>>>> b848ecd (fixed railway dackend deployment)
