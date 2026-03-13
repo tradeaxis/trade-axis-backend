@@ -70,80 +70,89 @@ exports.listUsers = async (req, res) => {
 exports.createUser = async (req, res) => {
   try {
     const { 
-      email, 
+      loginId,
       password, 
       firstName, 
       lastName, 
       phone, 
+      email,
       role = 'user',
-      leverage = 5,
-      brokerageRate = 0.0003,
-      maxSavedAccounts = 3,
+      leverage = 300,
+      brokerageRate = 0.0006,
+      maxSavedAccounts = 10,
       demoBalance = 100000,
       createDemo = true,
       createLive = true,
     } = req.body;
 
-    if (!email) {
-      return res.status(400).json({ success: false, message: 'Email is required' });
+    if (!loginId || !loginId.trim()) {
+      return res.status(400).json({ success: false, message: 'User ID is required' });
     }
-    if (!firstName || !lastName) {
-      return res.status(400).json({ success: false, message: 'First name and last name are required' });
-    }
+
     if (!createDemo && !createLive) {
       return res.status(400).json({ success: false, message: 'Select at least one account type' });
     }
 
-    const { data: existingUser } = await supabase
+    const cleanLoginId = loginId.trim().toUpperCase();
+
+    // Check if loginId already exists
+    const { data: existingById } = await supabase
       .from('users')
       .select('id')
-      .eq('email', email.toLowerCase().trim())
+      .eq('login_id', cleanLoginId)
       .maybeSingle();
 
-    if (existingUser) {
-      return res.status(400).json({ success: false, message: 'Email already registered' });
+    if (existingById) {
+      return res.status(400).json({ success: false, message: `User ID "${cleanLoginId}" already exists. Choose a different one.` });
     }
 
-    // Find max TA number from BOTH user_id and login_id columns
-    const { data: allUsers } = await supabase
+    // Also check user_id column
+    const { data: existingByUserId } = await supabase
       .from('users')
-      .select('user_id, login_id')
-      .order('created_at', { ascending: false })
-      .limit(20);
+      .select('id')
+      .eq('user_id', cleanLoginId)
+      .maybeSingle();
 
-    let maxNum = 999;
-    if (allUsers) {
-      for (const u of allUsers) {
-        const m1 = (u.user_id || '').match(/TA(\d+)/);
-        const m2 = (u.login_id || '').match(/TA(\d+)/);
-        if (m1) maxNum = Math.max(maxNum, parseInt(m1[1], 10));
-        if (m2) maxNum = Math.max(maxNum, parseInt(m2[1], 10));
+    if (existingByUserId) {
+      return res.status(400).json({ success: false, message: `User ID "${cleanLoginId}" already exists. Choose a different one.` });
+    }
+
+    // If email provided, check uniqueness
+    const userEmail = email ? email.toLowerCase().trim() : `${cleanLoginId.toLowerCase()}@tradeaxis.local`;
+    
+    if (email) {
+      const { data: existingEmail } = await supabase
+        .from('users')
+        .select('id')
+        .eq('email', userEmail)
+        .maybeSingle();
+
+      if (existingEmail) {
+        return res.status(400).json({ success: false, message: 'Email already registered' });
       }
     }
 
-    const newUserId = `TA${maxNum + 1}`;
-    const newLoginId = `TA${maxNum + 1}`;
+    // Default password is TA2626
+    const userPassword = password || 'TA2626';
+    const hashedPassword = await bcrypt.hash(userPassword, 12);
 
-    // Hash password
-    const tempPassword = password || generateTempPassword();
-    const hashedPassword = await bcrypt.hash(tempPassword, 12);
-
-    // Insert with BOTH user_id and login_id explicitly set
+    // must_change_password = true means first login will prompt password change
     const { data: user, error: userError } = await supabase
       .from('users')
       .insert([{
-        user_id: newUserId,
-        login_id: newLoginId,
-        email: email.toLowerCase().trim(),
+        user_id: cleanLoginId,
+        login_id: cleanLoginId,
+        email: userEmail,
         password_hash: hashedPassword,
-        first_name: firstName.substring(0, 50),
-        last_name: lastName.substring(0, 50),
-        phone: (phone || '0000000000').substring(0, 15),
+        first_name: String(firstName || cleanLoginId).trim().substring(0, 50),
+        last_name: String(lastName || '').trim().substring(0, 50),
+        phone: String(phone || '').trim().substring(0, 15),
         role: (role || 'user').substring(0, 20),
         is_verified: false,
         is_active: true,
-        max_saved_accounts: Number(maxSavedAccounts) || -1,
+        max_saved_accounts: Number(maxSavedAccounts) || 10,
         closing_mode: false,
+        must_change_password: true,
       }])
       .select()
       .single();
@@ -156,17 +165,17 @@ exports.createUser = async (req, res) => {
       });
     }
 
-    // Update optional fields separately
+    // Update optional fields separately (in case columns don't exist yet)
     try {
       await supabase
         .from('users')
         .update({
-          leverage: Number(leverage) || 5,
-          brokerage_rate: Number(brokerageRate) || 0.0003,
+          leverage: Number(leverage) || 300,
+          brokerage_rate: Number(brokerageRate) || 0.0006,
         })
         .eq('id', user.id);
     } catch (e) {
-      // silent
+      // silent — columns may not exist
     }
 
     // Create accounts
@@ -185,7 +194,7 @@ exports.createUser = async (req, res) => {
           equity: Number(demoBalance) || 100000,
           margin: 0,
           free_margin: Number(demoBalance) || 100000,
-          leverage: Number(leverage) || 5,
+          leverage: Number(leverage) || 300,
           currency: 'INR',
           is_active: true,
         }]);
@@ -205,7 +214,7 @@ exports.createUser = async (req, res) => {
           equity: 0,
           margin: 0,
           free_margin: 0,
-          leverage: Number(leverage) || 5,
+          leverage: Number(leverage) || 300,
           currency: 'INR',
           is_active: true,
         }]);
@@ -216,10 +225,10 @@ exports.createUser = async (req, res) => {
       success: true, 
       data: {
         user,
-        loginId: newLoginId,
-        tempPassword: password ? null : tempPassword,
+        loginId: cleanLoginId,
+        tempPassword: userPassword === 'TA2626' ? 'TA2626' : null,
       },
-      message: 'User created successfully' 
+      message: `User ${cleanLoginId} created successfully` 
     });
   } catch (error) {
     console.error('createUser full error:', error);
@@ -283,7 +292,7 @@ exports.resetPassword = async (req, res) => {
 exports.getLeverageOptions = async (req, res) => {
   res.json({
     success: true,
-    options: [1, 2, 3, 5, 10, 15, 20, 25, 50, 100, 200],
+    options: [1, 2, 5, 10, 20, 25, 50, 100, 200, 300, 500, 1000],
   });
 };
 
