@@ -4,6 +4,7 @@ const { supabase } = require('../config/supabase');
 const marketDataService = require('../services/marketDataService');
 const kiteStreamService = require('../services/kiteStreamService');
 const tradingService = require('../services/tradingService');
+const { isMarketOpen } = require('../services/marketStatus');
 
 class SocketHandler {
   constructor(io) {
@@ -178,6 +179,11 @@ class SocketHandler {
   startPnLUpdates() {
     this.pnlUpdateInterval = setInterval(async () => {
       try {
+        // ✅ Skip P&L updates when market is closed
+        if (!isMarketOpen()) {
+          return; // No price changes, no SL/TP triggers, no PnL updates
+        }
+
         // 1. Single query for all open trades
         const { data: openTrades, error } = await supabase
           .from('trades')

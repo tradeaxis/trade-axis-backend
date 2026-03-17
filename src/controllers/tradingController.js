@@ -1,20 +1,7 @@
 // backend/src/controllers/tradingController.js
 const { supabase } = require('../config/supabase');
 const kiteStreamService = require('../services/kiteStreamService');
-
-// ============ MARKET HOURS CHECK ============
-const isMarketOpen = () => {
-  const now = new Date();
-  const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
-  const ist = new Date(utcMs + 5.5 * 3600000);
-
-  const day = ist.getDay(); // 0=Sun, 6=Sat
-  if (day === 0 || day === 6) return false;
-
-  const mins = ist.getHours() * 60 + ist.getMinutes();
-  // Market hours: 9:15 AM to 3:30 PM IST
-  return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30;
-};
+const { isMarketOpen, getHolidayStatus } = require('../services/marketStatus');
 
 
 // ============ GET POSITIONS ============
@@ -107,9 +94,13 @@ exports.placeOrder = async (req, res) => {
     //  MARKET HOURS CHECK
     // ════════════════════════════════════════
     if (!isMarketOpen()) {
+      const holiday = getHolidayStatus();
+      const reason = holiday.isHoliday
+        ? `Market Holiday: ${holiday.message || 'Market is closed today by admin.'}`
+        : 'Market is closed. Orders can only be placed between 9:15 AM and 3:30 PM IST, Monday to Friday.';
       return res.status(400).json({
         success: false,
-        message: 'Market is closed. Orders can only be placed between 9:15 AM and 3:30 PM IST, Monday to Friday.',
+        message: reason,
       });
     }
 
@@ -264,7 +255,9 @@ exports.placeOrder = async (req, res) => {
     }
 
     const brokerageRate = userBrokerageRate;
-    const buyBrokerage = type === 'buy' ? openPrice * parseFloat(quantity) * lotSize * brokerageRate : 0;
+    // Commission on entry for BOTH buy and sell orders
+    const entryBrokerage = openPrice * parseFloat(quantity) * lotSize * brokerageRate;
+    const buyBrokerage = entryBrokerage; // "buy_brokerage" column stores entry-side brokerage regardless of direction
 
     // ════════════════════════════════════════
     //  POSITION MERGING — Same symbol + same direction → merge
@@ -358,7 +351,10 @@ exports.placeOrder = async (req, res) => {
       brokerage: buyBrokerage,
       buy_brokerage: buyBrokerage,
       sell_brokerage: 0,
-      profit: 0,
+
+      // ✅ immediately reflect entry commission in floating P&L
+      profit: -buyBrokerage,
+
       status: 'open',
       comment,
       open_time: new Date().toISOString(),
@@ -403,6 +399,16 @@ exports.closePosition = async (req, res) => {
     }
     if (!accountId) {
       return res.status(400).json({ success: false, message: 'Account ID is required' });
+    }
+
+    // Block close when market is off (unless admin override via header)
+    const isAdminClose = req.headers['x-admin-close'] === 'true';
+    if (!isMarketOpen() && !isAdminClose) {
+      const holiday = getHolidayStatus();
+      const reason = holiday.isHoliday
+        ? `Market Holiday: ${holiday.message || 'Market is closed today.'}`
+        : 'Market is closed. Positions cannot be closed outside trading hours.';
+      return res.status(400).json({ success: false, message: reason });
     }
 
     // Verify trade ownership

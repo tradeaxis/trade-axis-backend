@@ -135,7 +135,6 @@ const getDeals = async (req, res) => {
       return res.status(400).json({ success: false, message: 'accountId is required' });
     }
 
-    // Calculate period start date
     const now = new Date();
     let startDate = null;
 
@@ -168,163 +167,159 @@ const getDeals = async (req, res) => {
         startDate = null;
     }
 
-    const deals = [];
+    const allDeals = [];
 
-    // 1. Get closed trades (profits)
-    let tradesQuery = supabase
-      .from('trades')
-      .select('*')
-      .eq('account_id', accountId)
-      .eq('user_id', userId)
-      .eq('status', 'closed')
-      .order('close_time', { ascending: false })
-      .limit(parseInt(limit, 10));
-
-    if (startDate) {
-      tradesQuery = tradesQuery.gte('close_time', startDate.toISOString());
-    }
-
-    const { data: trades, error: tradesError } = await tradesQuery;
-    if (!tradesError && trades) {
-      trades.forEach(trade => {
-        deals.push({
-          id: `trade-${trade.id}`,
-          type: 'profit',
-          dealType: trade.profit >= 0 ? 'profit' : 'loss',
-          symbol: trade.symbol,
-          description: `${trade.trade_type.toUpperCase()} ${trade.quantity} ${trade.symbol}`,
-          amount: parseFloat(trade.profit || 0),
-          commission: parseFloat(trade.brokerage || 0),
-          time: trade.close_time,
-          status: 'completed',
-          tradeId: trade.id
-        });
-
-        // Add commission as separate deal if exists
-        if (trade.brokerage && parseFloat(trade.brokerage) > 0) {
-          deals.push({
-            id: `commission-${trade.id}`,
-            type: 'commission',
-            dealType: 'commission',
-            symbol: trade.symbol,
-            description: `Commission for ${trade.symbol}`,
-            amount: -parseFloat(trade.brokerage || 0),
-            commission: 0,
-            time: trade.close_time,
-            status: 'completed',
-            tradeId: trade.id
-          });
-        }
-      });
-    }
-
-    // 2. Get deposits
-    let depositsQuery = supabase
-      .from('transactions')
-      .select('*')
-      .eq('account_id', accountId)
-      .eq('user_id', userId)
-      .eq('transaction_type', 'deposit')
-      .eq('status', 'completed')
-      .order('created_at', { ascending: false })
-      .limit(parseInt(limit, 10));
-
-    if (startDate) {
-      depositsQuery = depositsQuery.gte('created_at', startDate.toISOString());
-    }
-
-    const { data: deposits, error: depositsError } = await depositsQuery;
-    if (!depositsError && deposits) {
-      deposits.forEach(dep => {
-        deals.push({
-          id: `deposit-${dep.id}`,
-          type: 'deposit',
-          dealType: 'deposit',
-          symbol: null,
-          description: `Deposit via ${dep.payment_method || 'Razorpay'}`,
-          amount: parseFloat(dep.amount || 0),
-          commission: 0,
-          time: dep.processed_at || dep.created_at,
-          status: dep.status,
-          transactionId: dep.id
-        });
-      });
-    }
-
-    // 3. Get withdrawals
-    let withdrawalsQuery = supabase
-      .from('transactions')
-      .select('*')
-      .eq('account_id', accountId)
-      .eq('user_id', userId)
-      .in('transaction_type', ['withdraw', 'withdrawal'])
-      .order('created_at', { ascending: false })
-      .limit(parseInt(limit, 10));
-
-    if (startDate) {
-      withdrawalsQuery = withdrawalsQuery.gte('created_at', startDate.toISOString());
-    }
-
-    const { data: withdrawals, error: withdrawalsError } = await withdrawalsQuery;
-    if (!withdrawalsError && withdrawals) {
-      withdrawals.forEach(wth => {
-        deals.push({
-          id: `withdrawal-${wth.id}`,
-          type: 'withdrawal',
-          dealType: 'withdrawal',
-          symbol: null,
-          description: `Withdrawal to bank`,
-          amount: -parseFloat(wth.amount || 0),
-          commission: 0,
-          time: wth.processed_at || wth.created_at,
-          status: wth.status,
-          transactionId: wth.id
-        });
-      });
-    }
-
-    // Sort all deals by time (newest first)
-    deals.sort((a, b) => new Date(b.time) - new Date(a.time));
-
-    // ✅ Calculate running balance
-    // Get current account balance
+    // Get account balance
     const { data: account } = await supabase
       .from('accounts')
       .select('balance')
       .eq('id', accountId)
       .single();
 
-    let runningBalance = parseFloat(account?.balance || 0);
-    
-    // Calculate running balance for each deal (working backwards)
-    const dealsWithBalance = deals.map((deal, index) => {
-      const balanceAfter = runningBalance;
-      runningBalance = runningBalance - deal.amount; // Subtract to go back in time
-      return {
-        ...deal,
-        balance: balanceAfter
-      };
+    // 1) TRADES - include OPEN + CLOSED so entry commission shows immediately
+    const { data: trades, error: tradesError } = await supabase
+      .from('trades')
+      .select('*')
+      .eq('account_id', accountId)
+      .eq('user_id', userId)
+      .order('open_time', { ascending: false })
+      .limit(1000);
+
+    if (tradesError) throw tradesError;
+
+    const filteredTrades = (trades || []).filter((trade) => {
+      if (!startDate) return true;
+      const openOk = trade.open_time && new Date(trade.open_time) >= startDate;
+      const closeOk = trade.close_time && new Date(trade.close_time) >= startDate;
+      return openOk || closeOk;
     });
 
-    // Summary
+    filteredTrades.forEach((trade) => {
+      const qty = Number(trade.quantity || 0);
+      const entryCommission = Number(trade.buy_brokerage || trade.brokerage || 0);
+
+      // Entry row
+      allDeals.push({
+        id: `entry-${trade.id}`,
+        source: 'trade',
+        side: 'entry',
+        type: trade.trade_type, // buy / sell
+        dealLabel: trade.trade_type === 'buy' ? 'Buy In' : 'Sell In',
+        symbol: trade.symbol,
+        quantity: qty,
+        price: Number(trade.open_price || 0),
+        amount: 0,
+        profit: 0,
+        commission: entryCommission,
+        time: trade.open_time,
+        status: 'completed',
+        tradeId: trade.id,
+      });
+
+      // Exit row only if closed
+      if (trade.status === 'closed' && trade.close_time) {
+        const exitCommission = Number(trade.sell_brokerage || 0);
+
+        allDeals.push({
+          id: `exit-${trade.id}`,
+          source: 'trade',
+          side: 'exit',
+          type: trade.trade_type === 'buy' ? 'sell' : 'buy',
+          dealLabel: trade.trade_type === 'buy' ? 'Sell Out' : 'Buy Out',
+          symbol: trade.symbol,
+          quantity: qty,
+          price: Number(trade.close_price || 0),
+          amount: Number(trade.profit || 0),
+          profit: Number(trade.profit || 0),
+          commission: exitCommission,
+          time: trade.close_time,
+          status: 'completed',
+          tradeId: trade.id,
+        });
+      }
+    });
+
+    // 2) Deposits / Withdrawals
+    const { data: txns, error: txnsError } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('account_id', accountId)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(500);
+
+    if (txnsError) throw txnsError;
+
+    const filteredTxns = (txns || []).filter((txn) => {
+      if (!startDate) return true;
+      return txn.created_at && new Date(txn.created_at) >= startDate;
+    });
+
+    filteredTxns.forEach((txn) => {
+      if (txn.transaction_type === 'deposit' && txn.status === 'completed') {
+        allDeals.push({
+          id: `deposit-${txn.id}`,
+          source: 'transaction',
+          side: 'deposit',
+          type: 'deposit',
+          dealLabel: 'Deposit',
+          symbol: null,
+          quantity: null,
+          price: null,
+          amount: Number(txn.amount || 0),
+          profit: 0,
+          commission: 0,
+          time: txn.processed_at || txn.created_at,
+          status: txn.status,
+          transactionId: txn.id,
+        });
+      }
+
+      if (['withdraw', 'withdrawal'].includes(txn.transaction_type)) {
+        allDeals.push({
+          id: `withdrawal-${txn.id}`,
+          source: 'transaction',
+          side: 'withdrawal',
+          type: 'withdrawal',
+          dealLabel: 'Withdrawal',
+          symbol: null,
+          quantity: null,
+          price: null,
+          amount: -Number(txn.amount || 0),
+          profit: 0,
+          commission: 0,
+          time: txn.processed_at || txn.created_at,
+          status: txn.status,
+          transactionId: txn.id,
+        });
+      }
+    });
+
+    // Sort latest first
+    allDeals.sort((a, b) => new Date(b.time) - new Date(a.time));
+
+    const deals = allDeals.slice(0, parseInt(limit, 10));
+
+    const exitDeals = allDeals.filter((d) => d.source === 'trade' && d.side === 'exit');
+
     const summary = {
-      totalProfit: deals.filter(d => d.type === 'profit' && d.amount > 0).reduce((s, d) => s + d.amount, 0),
-      totalLoss: Math.abs(deals.filter(d => d.type === 'profit' && d.amount < 0).reduce((s, d) => s + d.amount, 0)),
-      totalDeposits: deals.filter(d => d.type === 'deposit').reduce((s, d) => s + d.amount, 0),
-      totalWithdrawals: Math.abs(deals.filter(d => d.type === 'withdrawal').reduce((s, d) => s + d.amount, 0)),
-      totalCommission: Math.abs(deals.filter(d => d.type === 'commission').reduce((s, d) => s + d.amount, 0)),
-      netPnL: deals.filter(d => d.type === 'profit').reduce((s, d) => s + d.amount, 0),
-      currentBalance: parseFloat(account?.balance || 0)
+      totalProfit: exitDeals.filter((d) => d.amount > 0).reduce((s, d) => s + d.amount, 0),
+      totalLoss: Math.abs(exitDeals.filter((d) => d.amount < 0).reduce((s, d) => s + d.amount, 0)),
+      totalDeposits: allDeals.filter((d) => d.type === 'deposit').reduce((s, d) => s + d.amount, 0),
+      totalWithdrawals: Math.abs(allDeals.filter((d) => d.type === 'withdrawal').reduce((s, d) => s + d.amount, 0)),
+      totalCommission: allDeals.reduce((s, d) => s + Number(d.commission || 0), 0),
+      netPnL: exitDeals.reduce((s, d) => s + d.amount, 0),
+      currentBalance: Number(account?.balance || 0),
     };
 
     return res.status(200).json({
       success: true,
       data: {
-        deals: dealsWithBalance,
+        deals,
         summary,
         period,
-        count: dealsWithBalance.length
-      }
+        count: deals.length,
+      },
     });
   } catch (error) {
     console.error('getDeals error:', error);

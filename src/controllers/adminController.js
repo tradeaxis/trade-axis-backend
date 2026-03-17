@@ -133,7 +133,7 @@ exports.createUser = async (req, res) => {
     }
 
     // Default password is TA2626
-    const userPassword = password || 'TA2626';
+    const userPassword = password || 'TA1234';
     const hashedPassword = await bcrypt.hash(userPassword, 12);
 
     // must_change_password = true means first login will prompt password change
@@ -226,7 +226,7 @@ exports.createUser = async (req, res) => {
       data: {
         user,
         loginId: cleanLoginId,
-        tempPassword: userPassword === 'TA2626' ? 'TA2626' : null,
+        tempPassword: userPassword === 'TA1234' ? 'TA1234' : null,
       },
       message: `User ${cleanLoginId} created successfully` 
     });
@@ -410,9 +410,12 @@ exports.addBalanceToAccount = async (req, res) => {
     const { id } = req.params;
     const { accountId, amount, accountType = 'live', note = 'Admin deposit' } = req.body;
 
-    if (!amount || amount <= 0) {
+    if (!amount || amount === 0) {
       return res.status(400).json({ success: false, message: 'Invalid amount' });
     }
+
+    const isReduction = amount < 0;
+    const absAmount = Math.abs(amount);
 
     let account;
 
@@ -441,7 +444,17 @@ exports.addBalanceToAccount = async (req, res) => {
       account = data;
     }
 
-    const newBalance = parseFloat(account.balance || 0) + parseFloat(amount);
+    const currentBalance = parseFloat(account.balance || 0);
+
+    // For reductions, validate sufficient balance
+    if (isReduction && absAmount > currentBalance) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot reduce ₹${absAmount}. Current balance is ₹${currentBalance.toFixed(2)}`,
+      });
+    }
+
+    const newBalance = currentBalance + parseFloat(amount); // amount is negative for reductions
     const newEquity = parseFloat(account.equity || 0) + parseFloat(amount);
     const newFreeMargin = newEquity - parseFloat(account.margin || 0);
 
@@ -459,15 +472,17 @@ exports.addBalanceToAccount = async (req, res) => {
     await supabase.from('transactions').insert({
       user_id: id,
       account_id: account.id,
-      type: 'deposit',
-      amount: parseFloat(amount),
+      type: isReduction ? 'withdrawal' : 'deposit',
+      amount: absAmount,
       status: 'completed',
-      description: note || 'Admin deposit',
+      description: note || (isReduction ? 'Admin reduction' : 'Admin deposit'),
     });
 
     res.json({
       success: true,
-      message: `₹${amount} added to account`,
+      message: isReduction
+        ? `₹${absAmount} reduced from account. New balance: ₹${newBalance.toFixed(2)}`
+        : `₹${absAmount} added to account. New balance: ₹${newBalance.toFixed(2)}`,
       newBalance,
     });
   } catch (error) {
@@ -858,6 +873,150 @@ exports.kiteStatus = async (req, res) => {
     });
   } catch (error) {
     console.error('kiteStatus error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ============ MARKET HOLIDAY TOGGLE ============
+exports.setMarketHoliday = async (req, res) => {
+  try {
+    const { isHoliday, message } = req.body;
+    const { setHoliday, getHolidayStatus } = require('../services/marketStatus');
+
+    setHoliday(!!isHoliday, message || '');
+
+    const status = getHolidayStatus();
+    res.json({
+      success: true,
+      data: status,
+      message: status.isHoliday
+        ? `Market holiday enabled: ${status.message}`
+        : 'Market holiday disabled. Normal trading resumed.',
+    });
+  } catch (error) {
+    console.error('setMarketHoliday error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.getMarketHoliday = async (req, res) => {
+  try {
+    const { getHolidayStatus, isMarketOpen } = require('../services/marketStatus');
+    const status = getHolidayStatus();
+
+    res.json({
+      success: true,
+      data: {
+        ...status,
+        marketOpen: isMarketOpen(),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ============ ADMIN MANUAL CLOSE POSITION ============
+exports.adminClosePosition = async (req, res) => {
+  try {
+    const { tradeId, closePrice: manualPrice, reason } = req.body;
+
+    if (!tradeId) {
+      return res.status(400).json({ success: false, message: 'Trade ID is required' });
+    }
+
+    // Get the trade
+    const { data: trade, error: tradeError } = await supabase
+      .from('trades')
+      .select('*, accounts!inner(user_id, balance, margin)')
+      .eq('id', tradeId)
+      .eq('status', 'open')
+      .single();
+
+    if (tradeError || !trade) {
+      return res.status(404).json({ success: false, message: 'Trade not found or already closed' });
+    }
+
+    // Get user brokerage rate
+    const { data: userData } = await supabase
+      .from('users')
+      .select('brokerage_rate')
+      .eq('id', trade.accounts.user_id)
+      .single();
+
+    const brokerageRate = userData?.brokerage_rate || 0.0003;
+
+    // Determine close price
+    let closePrice;
+    if (manualPrice && Number(manualPrice) > 0) {
+      closePrice = Number(manualPrice);
+    } else {
+      // Use live price
+      const kiteStreamService = require('../services/kiteStreamService');
+      const livePrice = kiteStreamService.getPrice(trade.symbol);
+      if (livePrice) {
+        closePrice = trade.trade_type === 'buy' ? livePrice.bid : livePrice.ask;
+      } else {
+        closePrice = parseFloat(trade.current_price || trade.open_price);
+      }
+    }
+
+    if (!closePrice || closePrice <= 0) {
+      return res.status(400).json({ success: false, message: 'Cannot determine close price' });
+    }
+
+    const tradeQuantity = parseFloat(trade.quantity);
+    const direction = trade.trade_type === 'buy' ? 1 : -1;
+    const priceDiff = (closePrice - parseFloat(trade.open_price)) * direction;
+    const grossProfit = priceDiff * tradeQuantity;
+    
+    const sellBrokerage = closePrice * tradeQuantity * brokerageRate;
+    const buyBrokerage = parseFloat(trade.buy_brokerage || trade.brokerage || 0);
+    const totalBrokerage = buyBrokerage + sellBrokerage;
+    const netProfit = grossProfit - totalBrokerage;
+
+    const closeTime = new Date().toISOString();
+
+    // Close the trade
+    const { data: closedTrade, error: updateError } = await supabase
+      .from('trades')
+      .update({
+        close_price: closePrice,
+        profit: netProfit,
+        sell_brokerage: sellBrokerage,
+        brokerage: totalBrokerage,
+        status: 'closed',
+        close_time: closeTime,
+        updated_at: closeTime,
+        comment: `Admin close: ${reason || 'Manual close by admin'}`,
+      })
+      .eq('id', tradeId)
+      .select()
+      .single();
+
+    if (updateError) throw updateError;
+
+    // Update account
+    const newBalance = parseFloat(trade.accounts.balance) + netProfit;
+    const newMargin = Math.max(0, parseFloat(trade.accounts.margin) - parseFloat(trade.margin || 0));
+
+    await supabase
+      .from('accounts')
+      .update({
+        balance: newBalance,
+        margin: newMargin,
+        free_margin: newBalance - newMargin,
+        updated_at: closeTime,
+      })
+      .eq('id', trade.account_id);
+
+    res.json({
+      success: true,
+      data: closedTrade,
+      message: `Admin closed ${trade.symbol} ${trade.trade_type.toUpperCase()} x${tradeQuantity} @ ₹${closePrice.toFixed(2)}. P&L: ₹${netProfit.toFixed(2)}`,
+    });
+  } catch (error) {
+    console.error('adminClosePosition error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 };

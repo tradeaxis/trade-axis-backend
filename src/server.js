@@ -19,7 +19,7 @@ const { Server } = require('socket.io');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const compression = require('compression');
-const cron = require('node-cron');
+const nodeCron = require('node-cron');
 
 const { testConnection } = require('./config/supabase');
 
@@ -197,10 +197,11 @@ const startServer = async () => {
     console.log('');
 
     // Weekly settlement cron (Saturday 01:00 IST)
+    // Weekly settlement cron (Saturday 01:00 IST)
     const cronExpr = process.env.SETTLEMENT_CRON || '0 1 * * 6';
     const tz = process.env.SETTLEMENT_TIMEZONE || 'Asia/Kolkata';
 
-    cron.schedule(
+    nodeCron.schedule(
       cronExpr,
       async () => {
         console.log('⏰ Running scheduled weekly settlement...');

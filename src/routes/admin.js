@@ -31,6 +31,13 @@ router.get('/withdrawals', adminController.listWithdrawals);
 router.post('/withdrawals/:id/approve', adminController.approveWithdrawal);
 router.post('/withdrawals/:id/reject', adminController.rejectWithdrawal);
 
+// Market Holiday
+router.post('/market-holiday', adminController.setMarketHoliday);
+router.get('/market-holiday', adminController.getMarketHoliday);
+
+// Admin manual close position
+router.post('/close-position', adminController.adminClosePosition);
+
 // Kite
 router.get('/kite/login-url', adminController.getKiteLoginUrl);
 router.post('/kite/session', adminController.createKiteSession);

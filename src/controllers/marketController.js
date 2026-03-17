@@ -66,6 +66,25 @@ exports.getSymbols = async (req, res) => {
       if (offset >= 10000) hasMore = false;
     }
 
+    // Always include Gift Nifty if present in DB
+    // Always include Gift Nifty if present in DB
+    const { data: giftRows } = await supabase
+      .from('symbols')
+      .select('*')
+      .eq('is_active', true)
+      .or('symbol.ilike.%GIFT%NIFTY%,display_name.ilike.%GIFT%NIFTY%,underlying.ilike.%GIFT%NIFTY%')
+      .limit(10);
+
+    if (giftRows && giftRows.length > 0) {
+      const seenSymbols = new Set(allSymbols.map((s) => s.symbol));
+      giftRows.forEach((g) => {
+        if (!seenSymbols.has(g.symbol)) {
+          allSymbols.unshift(g);
+          seenSymbols.add(g.symbol);
+        }
+      });
+    }
+
     if (allSymbols.length > parseInt(limit)) {
       allSymbols = allSymbols.slice(0, parseInt(limit));
     }
