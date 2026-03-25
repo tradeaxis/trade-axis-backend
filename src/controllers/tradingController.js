@@ -91,13 +91,20 @@ exports.placeOrder = async (req, res) => {
     }
 
     // ════════════════════════════════════════
-    //  MARKET HOURS CHECK
+    //  MARKET HOURS CHECK (symbol-aware for commodities)
     // ════════════════════════════════════════
-    if (!isMarketOpen()) {
+    if (!isMarketOpen(symbol)) {
       const holiday = getHolidayStatus();
-      const reason = holiday.isHoliday
-        ? `Market Holiday: ${holiday.message || 'Market is closed today by admin.'}`
-        : 'Market is closed. Orders can only be placed between 9:15 AM and 3:30 PM IST, Monday to Friday.';
+      const { isCommoditySymbol } = require('../services/marketStatus');
+      const isCommodity = isCommoditySymbol(symbol);
+      let reason;
+      if (holiday.isHoliday) {
+        reason = `Market Holiday: ${holiday.message || 'Market is closed today by admin.'}`;
+      } else if (isCommodity) {
+        reason = 'Commodity market is closed. Trading hours: 9:00 AM – 11:30 PM IST, Monday to Friday.';
+      } else {
+        reason = 'Market is closed. Orders can only be placed between 9:15 AM and 3:30 PM IST, Monday to Friday.';
+      }
       return res.status(400).json({
         success: false,
         message: reason,
@@ -403,11 +410,32 @@ exports.closePosition = async (req, res) => {
 
     // Block close when market is off (unless admin override via header)
     const isAdminClose = req.headers['x-admin-close'] === 'true';
-    if (!isMarketOpen() && !isAdminClose) {
+
+    // Look up the trade's symbol for commodity-aware market check
+    let tradeSymbolForCheck = '';
+    try {
+      const { data: tradeCheck } = await supabase
+        .from('trades')
+        .select('symbol')
+        .eq('id', tradeId)
+        .single();
+      tradeSymbolForCheck = tradeCheck?.symbol || '';
+    } catch (e) {
+      // If lookup fails, proceed with default equity hours check
+    }
+
+    if (!isMarketOpen(tradeSymbolForCheck) && !isAdminClose) {
       const holiday = getHolidayStatus();
-      const reason = holiday.isHoliday
-        ? `Market Holiday: ${holiday.message || 'Market is closed today.'}`
-        : 'Market is closed. Positions cannot be closed outside trading hours.';
+      const { isCommoditySymbol } = require('../services/marketStatus');
+      const isCommodity = isCommoditySymbol(tradeSymbolForCheck);
+      let reason;
+      if (holiday.isHoliday) {
+        reason = `Market Holiday: ${holiday.message || 'Market is closed today.'}`;
+      } else if (isCommodity) {
+        reason = 'Commodity market is closed. Trading hours: 9:00 AM – 11:30 PM IST, Monday to Friday.';
+      } else {
+        reason = 'Market is closed. Positions cannot be closed outside trading hours.';
+      }
       return res.status(400).json({ success: false, message: reason });
     }
 
@@ -521,37 +549,70 @@ exports.closePosition = async (req, res) => {
         message: `Position closed at ${closePrice}. P&L: ₹${netProfit.toFixed(2)}`,
       });
     } else {
-      const remainingQuantity = tradeQuantity - quantityToClose;
-      const remainingBuyBrokerage = (parseFloat(trade.buy_brokerage || trade.brokerage || 0) / tradeQuantity) * remainingQuantity;
-      const remainingMargin = (parseFloat(trade.margin || 0) / tradeQuantity) * remainingQuantity;
+          const remainingQuantity = tradeQuantity - quantityToClose;
+          const remainingBuyBrokerage = (parseFloat(trade.buy_brokerage || trade.brokerage || 0) / tradeQuantity) * remainingQuantity;
+          const remainingMargin = (parseFloat(trade.margin || 0) / tradeQuantity) * remainingQuantity;
 
-      await supabase
-        .from('trades')
-        .update({
-          quantity: remainingQuantity,
-          margin: remainingMargin,
-          buy_brokerage: remainingBuyBrokerage,
-          brokerage: remainingBuyBrokerage,
-          updated_at: closeTime,
-        })
-        .eq('id', tradeId);
+          // Update the existing trade with remaining quantity
+          await supabase
+            .from('trades')
+            .update({
+              quantity: remainingQuantity,
+              margin: remainingMargin,
+              buy_brokerage: remainingBuyBrokerage,
+              brokerage: remainingBuyBrokerage,
+              updated_at: closeTime,
+            })
+            .eq('id', tradeId);
 
-      const newBalance = parseFloat(trade.accounts.balance) + netProfit;
-      const closedMargin = (parseFloat(trade.margin || 0) / tradeQuantity) * quantityToClose;
-      const newMargin = Math.max(0, parseFloat(trade.accounts.margin) - closedMargin);
-      const newFreeMargin = newBalance - newMargin;
+          // ✅ CREATE a separate closed trade record for the partial close
+          const closedPartialRecord = {
+            user_id: trade.user_id,
+            account_id: trade.account_id,
+            symbol: trade.symbol,
+            exchange: trade.exchange,
+            trade_type: trade.trade_type,
+            quantity: quantityToClose,
+            original_quantity: tradeQuantity,
+            open_price: parseFloat(trade.open_price),
+            close_price: closePrice,
+            current_price: closePrice,
+            stop_loss: parseFloat(trade.stop_loss || 0),
+            take_profit: parseFloat(trade.take_profit || 0),
+            margin: (parseFloat(trade.margin || 0) / tradeQuantity) * quantityToClose,
+            buy_brokerage: buyBrokerageProportional,
+            sell_brokerage: sellBrokerage,
+            brokerage: totalBrokerage,
+            profit: netProfit,
+            status: 'closed',
+            open_time: trade.open_time,
+            close_time: closeTime,
+            updated_at: closeTime,
+            comment: `Partial close: ${quantityToClose} of ${tradeQuantity}. ${trade.comment || ''}`.trim(),
+          };
 
-      await supabase
-        .from('accounts')
-        .update({ balance: newBalance, margin: newMargin, free_margin: newFreeMargin, updated_at: closeTime })
-        .eq('id', accountId);
+          try {
+            await supabase.from('trades').insert(closedPartialRecord);
+          } catch (insertErr) {
+            console.warn('Could not insert partial close record:', insertErr.message);
+          }
 
-      res.json({
-        success: true,
-        message: `Partially closed ${quantityToClose} of ${tradeQuantity}. P&L: ₹${netProfit.toFixed(2)}. Remaining: ${remainingQuantity}`,
-        data: { closedQuantity: quantityToClose, remainingQuantity, profit: netProfit },
-      });
-    }
+          const newBalance = parseFloat(trade.accounts.balance) + netProfit;
+          const closedMargin = (parseFloat(trade.margin || 0) / tradeQuantity) * quantityToClose;
+          const newMargin = Math.max(0, parseFloat(trade.accounts.margin) - closedMargin);
+          const newFreeMargin = newBalance - newMargin;
+
+          await supabase
+            .from('accounts')
+            .update({ balance: newBalance, margin: newMargin, free_margin: newFreeMargin, updated_at: closeTime })
+            .eq('id', accountId);
+
+          res.json({
+            success: true,
+            message: `Partially closed ${quantityToClose} of ${tradeQuantity}. P&L: ₹${netProfit.toFixed(2)}. Remaining: ${remainingQuantity}`,
+            data: { closedQuantity: quantityToClose, remainingQuantity, profit: netProfit },
+          });
+        }
   } catch (error) {
     console.error('Close position error:', error);
     res.status(500).json({ success: false, message: error.message || 'Failed to close position' });
@@ -755,15 +816,164 @@ exports.closeAllPositions = async (req, res) => {
 };
 
 exports.modifyPendingOrder = async (req, res) => {
-  res.json({ success: true, message: 'Not implemented' });
+  try {
+    const { orderId } = req.params;
+    const { price, stopLoss, takeProfit } = req.body;
+    const userId = req.user.id;
+
+    if (!orderId) {
+      return res.status(400).json({ success: false, message: 'Order ID is required' });
+    }
+
+    // Verify ownership and status
+    const { data: order, error } = await supabase
+      .from('pending_orders')
+      .select('*')
+      .eq('id', orderId)
+      .eq('user_id', userId)
+      .eq('status', 'pending')
+      .single();
+
+    if (error || !order) {
+      return res.status(404).json({ success: false, message: 'Pending order not found or already processed' });
+    }
+
+    // Validate new price if provided
+    if (price !== undefined && price !== null) {
+      const parsedPrice = parseFloat(price);
+      if (!parsedPrice || parsedPrice <= 0) {
+        return res.status(400).json({ success: false, message: 'Invalid price' });
+      }
+
+      // Get current market price for validation
+      const livePrice = kiteStreamService.getPrice(order.symbol);
+      const { data: symbolRows } = await supabase
+        .from('symbols')
+        .select('bid, ask, last_price')
+        .eq('symbol', order.symbol)
+        .limit(1);
+      const symbolData = symbolRows?.[0];
+
+      const currentBid = livePrice?.bid || parseFloat(symbolData?.bid || symbolData?.last_price || 0);
+      const currentAsk = livePrice?.ask || parseFloat(symbolData?.ask || symbolData?.last_price || 0);
+      const cmp = order.trade_type === 'buy' ? currentAsk : currentBid;
+
+      if (order.order_type === 'buy_limit' && parsedPrice > cmp * 0.995) {
+        return res.status(400).json({
+          success: false,
+          message: `Buy Limit price must be at least 0.5% below current price. Max: ₹${(cmp * 0.995).toFixed(2)}`,
+        });
+      }
+      if (order.order_type === 'sell_limit' && parsedPrice < cmp * 1.005) {
+        return res.status(400).json({
+          success: false,
+          message: `Sell Limit price must be at least 0.5% above current price. Min: ₹${(cmp * 1.005).toFixed(2)}`,
+        });
+      }
+    }
+
+    const updates = { updated_at: new Date().toISOString() };
+    if (price !== undefined && price !== null) updates.price = parseFloat(price);
+    if (stopLoss !== undefined) updates.stop_loss = parseFloat(stopLoss) || 0;
+    if (takeProfit !== undefined) updates.take_profit = parseFloat(takeProfit) || 0;
+
+    const { data: updatedOrder, error: updateError } = await supabase
+      .from('pending_orders')
+      .update(updates)
+      .eq('id', orderId)
+      .select()
+      .single();
+
+    if (updateError) throw updateError;
+
+    res.json({
+      success: true,
+      data: updatedOrder,
+      message: 'Pending order modified successfully',
+    });
+  } catch (error) {
+    console.error('Modify pending order error:', error);
+    res.status(500).json({ success: false, message: 'Failed to modify pending order' });
+  }
 };
 
 exports.cancelPendingOrder = async (req, res) => {
-  res.json({ success: true, message: 'Not implemented' });
+  try {
+    const { orderId } = req.params;
+    const { accountId } = req.body;
+    const userId = req.user.id;
+
+    if (!orderId) {
+      return res.status(400).json({ success: false, message: 'Order ID is required' });
+    }
+
+    // Verify ownership and pending status
+    const { data: order, error } = await supabase
+      .from('pending_orders')
+      .select('*')
+      .eq('id', orderId)
+      .eq('user_id', userId)
+      .eq('status', 'pending')
+      .single();
+
+    if (error || !order) {
+      return res.status(404).json({ success: false, message: 'Pending order not found or already processed' });
+    }
+
+    const { data: cancelledOrder, error: updateError } = await supabase
+      .from('pending_orders')
+      .update({
+        status: 'cancelled',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', orderId)
+      .select()
+      .single();
+
+    if (updateError) throw updateError;
+
+    res.json({
+      success: true,
+      data: cancelledOrder,
+      message: `${order.order_type.replace('_', ' ').toUpperCase()} order for ${order.symbol} cancelled`,
+    });
+  } catch (error) {
+    console.error('Cancel pending order error:', error);
+    res.status(500).json({ success: false, message: 'Failed to cancel order' });
+  }
 };
 
 exports.cancelAllPendingOrders = async (req, res) => {
-  res.json({ success: true, message: 'Not implemented' });
+  try {
+    const { accountId } = req.body;
+    const userId = req.user.id;
+
+    if (!accountId) {
+      return res.status(400).json({ success: false, message: 'Account ID is required' });
+    }
+
+    const { data: orders, error } = await supabase
+      .from('pending_orders')
+      .update({
+        status: 'cancelled',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('account_id', accountId)
+      .eq('user_id', userId)
+      .eq('status', 'pending')
+      .select();
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      data: orders || [],
+      message: `${(orders || []).length} order(s) cancelled`,
+    });
+  } catch (error) {
+    console.error('Cancel all pending orders error:', error);
+    res.status(500).json({ success: false, message: 'Failed to cancel orders' });
+  }
 };
 
 exports.getTradeHistory = async (req, res) => {
@@ -1048,5 +1258,43 @@ exports.addQuantity = async (req, res) => {
       success: false,
       message: error.message || 'Failed to add quantity',
     });
+  }
+};
+
+// ============ PENDING ORDER HISTORY (cancelled, triggered, expired) ============
+exports.getPendingOrderHistory = async (req, res) => {
+  try {
+    const { accountId } = req.params;
+    const userId = req.user.id;
+
+    const { data: account, error: accountError } = await supabase
+      .from('accounts')
+      .select('id')
+      .eq('id', accountId)
+      .eq('user_id', userId)
+      .single();
+
+    if (accountError || !account) {
+      return res.status(404).json({ success: false, message: 'Account not found' });
+    }
+
+    const { data: orders, error } = await supabase
+      .from('pending_orders')
+      .select('*')
+      .eq('account_id', accountId)
+      .eq('user_id', userId)
+      .neq('status', 'pending')
+      .order('updated_at', { ascending: false })
+      .limit(200);
+
+    if (error) {
+      console.log('Pending order history query error:', error.message);
+      return res.json({ success: true, data: [] });
+    }
+
+    res.json({ success: true, data: orders || [] });
+  } catch (error) {
+    console.error('Get pending order history error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch order history' });
   }
 };

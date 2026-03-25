@@ -193,10 +193,9 @@ const startServer = async () => {
     console.log(`   ⚡ WS : ws://0.0.0.0:${PORT}`);
     console.log(`   🌍 ENV: ${process.env.NODE_ENV}`);
     console.log('   ✅ CORS: open (origin: true)');
-    console.log('══════════════════════════════════════════════════════════════');
+    console.log('═══��══════════════════════════════════════════════════════════');
     console.log('');
 
-    // Weekly settlement cron (Saturday 01:00 IST)
     // Weekly settlement cron (Saturday 01:00 IST)
     const cronExpr = process.env.SETTLEMENT_CRON || '0 1 * * 6';
     const tz = process.env.SETTLEMENT_TIMEZONE || 'Asia/Kolkata';
@@ -236,6 +235,21 @@ const startServer = async () => {
         if (kiteService.isSessionReady()) {
           const result = await kiteStreamService.start(io);
           console.log('✅ Kite stream auto-start result:', result);
+
+          // ── Auto-sync missing instruments after stream starts ──
+          try {
+            const { syncKiteInstruments } = require('./utils/syncKiteInstruments');
+            const syncResult = await syncKiteInstruments();
+            if (syncResult.success && syncResult.upserted > 0) {
+              console.log(`📊 Auto-synced ${syncResult.upserted} new instruments`);
+              await kiteStreamService.refreshSubscriptions();
+              console.log('🔄 Stream refreshed with new tokens');
+            } else {
+              console.log('📊 All instruments already in sync');
+            }
+          } catch (syncErr) {
+            console.warn('⚠️ Auto instrument sync failed:', syncErr.message);
+          }
         } else {
           console.log('ℹ️ Kite session not ready. Admin must create session daily.');
         }

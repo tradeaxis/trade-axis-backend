@@ -399,6 +399,8 @@ class TradingService {
   // Check and trigger pending orders (called by background job)
   async checkPendingOrders() {
     try {
+      const { isMarketOpen } = require('./marketStatus');
+
       // Get all pending orders
       const { data: orders, error } = await supabase
         .from('pending_orders')
@@ -408,6 +410,20 @@ class TradingService {
       if (error || !orders || orders.length === 0) return;
 
       for (const order of orders) {
+        // ── AUTO-CANCEL when market is closed for this symbol ──
+        if (!isMarketOpen(order.symbol)) {
+          await supabase
+            .from('pending_orders')
+            .update({
+              status: 'cancelled',
+              comment: (order.comment || '') + ' [Auto-cancelled: market closed]',
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', order.id);
+          console.log(`❌ Auto-cancelled pending order #${order.id} (${order.symbol}) — market closed`);
+          continue;
+        }
+
         // Get current price
         const { data: symbolData } = await supabase
           .from('symbols')

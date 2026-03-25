@@ -83,6 +83,7 @@ exports.createUser = async (req, res) => {
       demoBalance = 100000,
       createDemo = true,
       createLive = true,
+      liquidationType = 'liquidate',
     } = req.body;
 
     if (!loginId || !loginId.trim()) {
@@ -153,6 +154,7 @@ exports.createUser = async (req, res) => {
         max_saved_accounts: Number(maxSavedAccounts) || 10,
         closing_mode: false,
         must_change_password: true,
+        liquidation_type: liquidationType || 'liquidate',
       }])
       .select()
       .single();
@@ -881,16 +883,23 @@ exports.kiteStatus = async (req, res) => {
 exports.setMarketHoliday = async (req, res) => {
   try {
     const { isHoliday, message } = req.body;
-    const { setHoliday, getHolidayStatus } = require('../services/marketStatus');
+    const marketStatus = require('../services/marketStatus');
 
-    setHoliday(!!isHoliday, message || '');
+    if (typeof marketStatus.setHoliday !== 'function' || typeof marketStatus.getHolidayStatus !== 'function') {
+      return res.status(500).json({
+        success: false,
+        message: 'marketStatus service is misconfigured',
+      });
+    }
 
-    const status = getHolidayStatus();
+    marketStatus.setHoliday(!!isHoliday, message || '');
+
+    const status = marketStatus.getHolidayStatus();
     res.json({
       success: true,
       data: status,
       message: status.isHoliday
-        ? `Market holiday enabled: ${status.message}`
+        ? `Market holiday enabled: ${status.message || 'Holiday active'}`
         : 'Market holiday disabled. Normal trading resumed.',
     });
   } catch (error) {
@@ -901,17 +910,26 @@ exports.setMarketHoliday = async (req, res) => {
 
 exports.getMarketHoliday = async (req, res) => {
   try {
-    const { getHolidayStatus, isMarketOpen } = require('../services/marketStatus');
-    const status = getHolidayStatus();
+    const marketStatus = require('../services/marketStatus');
+
+    if (typeof marketStatus.getHolidayStatus !== 'function' || typeof marketStatus.isMarketOpen !== 'function') {
+      return res.status(500).json({
+        success: false,
+        message: 'marketStatus service is misconfigured',
+      });
+    }
+
+    const status = marketStatus.getHolidayStatus();
 
     res.json({
       success: true,
       data: {
         ...status,
-        marketOpen: isMarketOpen(),
+        marketOpen: marketStatus.isMarketOpen(),
       },
     });
   } catch (error) {
+    console.error('getMarketHoliday error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -1017,6 +1035,44 @@ exports.adminClosePosition = async (req, res) => {
     });
   } catch (error) {
     console.error('adminClosePosition error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ============ GET ALL OPEN POSITIONS (admin) ============
+exports.getAllOpenPositions = async (req, res) => {
+  try {
+    const { data: trades, error } = await supabase
+      .from('trades')
+      .select('id, symbol, trade_type, quantity, open_price, current_price, profit, margin, user_id, account_id, open_time')
+      .eq('status', 'open')
+      .order('open_time', { ascending: false })
+      .limit(500);
+
+    if (error) throw error;
+
+    const userIds = [...new Set((trades || []).map((t) => t.user_id))];
+
+    let userMap = {};
+    if (userIds.length > 0) {
+      const { data: users } = await supabase
+        .from('users')
+        .select('id, login_id')
+        .in('id', userIds);
+
+      (users || []).forEach((u) => {
+        userMap[u.id] = u.login_id;
+      });
+    }
+
+    const enriched = (trades || []).map((t) => ({
+      ...t,
+      user_login_id: userMap[t.user_id] || '—',
+    }));
+
+    res.json({ success: true, data: enriched });
+  } catch (error) {
+    console.error('getAllOpenPositions error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 };

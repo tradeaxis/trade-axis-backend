@@ -11,25 +11,21 @@ class KiteStreamService {
     this.tokenToSymbols = new Map();
     this.lastTickAt = null;
 
-    // ✅ In-memory price cache — instant reads, zero DB latency
     this.priceCache = new Map();
 
-    // ✅ Batch DB writes
     this.dirtySymbols = new Set();
     this.dbFlushInterval = null;
-    this.DB_FLUSH_MS = 5000; // Write to DB every 5s
+    this.DB_FLUSH_MS = 5000;
   }
 
   isRunning() {
     return this.running;
   }
 
-  /** Get live price from memory (instant, no DB) */
   getPrice(symbol) {
     return this.priceCache.get(String(symbol).toUpperCase()) || null;
   }
 
-  /** Get multiple prices from memory */
   getPrices(symbols) {
     const out = {};
     for (const s of symbols) {
@@ -90,7 +86,6 @@ class KiteStreamService {
       this.ticker.setMode(mode, tokens);
     });
 
-    // ✅ Tick handler is SYNCHRONOUS — no await, no DB blocking
     this.ticker.on('ticks', (ticks) => {
       this.lastTickAt = new Date().toISOString();
       this.handleTicks(ticks);
@@ -122,7 +117,6 @@ class KiteStreamService {
         clearInterval(this.dbFlushInterval);
         this.dbFlushInterval = null;
       }
-      // Flush remaining dirty symbols before stopping
       await this.flushToDB();
       if (this.ticker) {
         this.ticker.disconnect();
@@ -134,11 +128,6 @@ class KiteStreamService {
     return { stopped: true };
   }
 
-  /**
-   * ✅ CORE FIX: Handle ticks synchronously
-   * Memory update + WebSocket emit = instant (< 1ms)
-   * DB writes happen separately every 5s
-   */
   handleTicks(ticks) {
     if (!ticks || ticks.length === 0) return;
 
@@ -179,11 +168,9 @@ class KiteStreamService {
       };
 
       for (const s of symbols) {
-        // ✅ Memory update (instant)
         this.priceCache.set(s, priceData);
         this.dirtySymbols.add(s);
 
-        // ✅ WebSocket emit (instant, no DB wait)
         this.io?.to(`symbol:${s}`).emit('price:update', {
           symbol: s,
           bid,
@@ -202,7 +189,6 @@ class KiteStreamService {
     }
   }
 
-  /** ✅ Batch flush dirty symbols to DB every N seconds */
   startDBFlush() {
     if (this.dbFlushInterval) clearInterval(this.dbFlushInterval);
 
@@ -222,7 +208,6 @@ class KiteStreamService {
     this.dirtySymbols.clear();
     const now = new Date().toISOString();
 
-    // Group symbols that share the same price (same instrument token)
     const groups = new Map();
     for (const sym of toFlush) {
       const p = this.priceCache.get(sym);
@@ -232,7 +217,6 @@ class KiteStreamService {
       groups.get(key).symbols.push(sym);
     }
 
-    // One DB call per unique price (much fewer than per-symbol)
     const promises = [];
     for (const [, { price, symbols }] of groups) {
       promises.push(
@@ -266,6 +250,29 @@ class KiteStreamService {
       cachedPrices: this.priceCache.size,
       pendingDBWrites: this.dirtySymbols.size,
     };
+  }
+
+  /**
+   * Rebuild token map and resubscribe — call after syncing new instruments
+   */
+  async refreshSubscriptions() {
+    if (!this.ticker || !this.running) {
+      console.log('ℹ️ Ticker not running, skip refresh');
+      return { refreshed: false };
+    }
+
+    const oldCount = this.tokenToSymbols.size;
+    await this.buildTokenMap();
+    const newCount = this.tokenToSymbols.size;
+
+    const tokens = Array.from(this.tokenToSymbols.keys());
+    const mode = String(process.env.KITE_TICK_MODE || 'full').toLowerCase();
+
+    this.ticker.subscribe(tokens);
+    this.ticker.setMode(mode, tokens);
+
+    console.log(`🔄 Refreshed subscriptions: ${oldCount} → ${newCount} tokens`);
+    return { refreshed: true, oldCount, newCount };
   }
 }
 

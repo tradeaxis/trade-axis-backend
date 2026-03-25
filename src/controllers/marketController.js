@@ -67,7 +67,6 @@ exports.getSymbols = async (req, res) => {
     }
 
     // Always include Gift Nifty if present in DB
-    // Always include Gift Nifty if present in DB
     const { data: giftRows } = await supabase
       .from('symbols')
       .select('*')
@@ -120,7 +119,6 @@ exports.getQuote = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Symbol not found' });
     }
 
-    // ✅ Overlay live price from memory cache
     const live = kiteStreamService.getPrice(sym);
 
     const quote = {
@@ -146,7 +144,7 @@ exports.getQuote = async (req, res) => {
   }
 };
 
-/** Historical candles — Kite only, no simulation */
+/** Historical candles — Kite only */
 exports.getCandles = async (req, res) => {
   try {
     const { symbol } = req.params;
@@ -197,6 +195,28 @@ exports.searchSymbols = async (req, res) => {
     res.json({ success: true, symbols: symbols || [], total: symbols?.length || 0 });
   } catch (error) {
     console.error('searchSymbols error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/** Sync missing instruments from Kite API */
+exports.syncInstruments = async (req, res) => {
+  try {
+    const { syncKiteInstruments } = require('../utils/syncKiteInstruments');
+    const result = await syncKiteInstruments();
+
+    if (result.success && result.upserted > 0) {
+      try {
+        const refreshResult = await kiteStreamService.refreshSubscriptions();
+        console.log('🔄 Stream refreshed after sync:', refreshResult);
+      } catch (e) {
+        console.warn('⚠️ Stream refresh failed:', e.message);
+      }
+    }
+
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Sync instruments error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 };

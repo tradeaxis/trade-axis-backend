@@ -89,6 +89,11 @@ class KiteService {
     return !!(this.kc && this.accessToken);
   }
 
+  /** Return the raw KiteConnect instance (used by syncKiteInstruments) */
+  getKiteInstance() {
+    return this.kc || null;
+  }
+
   getLoginURL() {
     if (!this.kc) {
       if (this.isConfigured()) {
@@ -197,14 +202,9 @@ class KiteService {
 
     const all = [...nfo, ...mcx, ...bfo];
 
-    // Filter FUT only (no options)
     return all.filter((i) => String(i.instrument_type).toUpperCase() === 'FUT');
   }
 
-  /**
-   * Sync ALL FUT instruments to Supabase.
-   * ✅ IMPORTANT: lot_size = 1 (1 lot = 1 share for this platform)
-   */
   async syncSymbolsToDB() {
     const instruments = await this.fetchFuturesInstruments();
 
@@ -219,7 +219,6 @@ class KiteService {
     const byUnderlying = new Map();
     const rows = [];
 
-    // 1) Create a row for EACH actual contract
     for (const inst of instruments) {
       const tradingsymbol = String(inst.tradingsymbol).toUpperCase();
       const underlying = String(inst.name || '').toUpperCase();
@@ -227,7 +226,6 @@ class KiteService {
 
       if (!underlying) continue;
 
-      // Determine category
       let category = 'stock_futures';
       if (exchange === 'MCX') category = 'commodity_futures';
       else if (sensexSet.has(underlying)) category = 'sensex_futures';
@@ -245,7 +243,7 @@ class KiteService {
         category,
         segment: exchange,
         instrument_type: 'FUT',
-        lot_size: 1, // ✅ 1 LOT = 1 SHARE
+        lot_size: 1,
         tick_size: Number(inst.tick_size || 0.05),
         kite_exchange: exchange,
         kite_tradingsymbol: tradingsymbol,
@@ -255,7 +253,6 @@ class KiteService {
         series: null,
         is_active: true,
         last_update: new Date().toISOString(),
-        // Store original lot size for reference
         original_lot_size: Number(inst.lot_size || 1),
       });
 
@@ -263,7 +260,6 @@ class KiteService {
       byUnderlying.get(underlying).push(inst);
     }
 
-    // 2) Create rolling aliases: UNDERLYING-I / II / III
     const seriesNames = ['I', 'II', 'III'];
     const seriesLabels = ['Near Month', 'Next Month', 'Far Month'];
 
@@ -294,7 +290,7 @@ class KiteService {
           category,
           segment: exchange,
           instrument_type: 'FUT',
-          lot_size: 1, // ✅ 1 LOT = 1 SHARE
+          lot_size: 1,
           tick_size: Number(inst.tick_size || 0.05),
           kite_exchange: exchange,
           kite_tradingsymbol: String(inst.tradingsymbol).toUpperCase(),
@@ -311,13 +307,11 @@ class KiteService {
 
     console.log(`📝 Upserting ${rows.length} symbols (${byUnderlying.size} underlyings)...`);
 
-    // Mark existing FUT symbols as inactive
     await supabase
       .from('symbols')
       .update({ is_active: false })
       .eq('instrument_type', 'FUT');
 
-    // Upsert in chunks
     const chunkSize = 500;
     let upsertedCount = 0;
 

@@ -24,5 +24,6 @@ router.delete('/pending-order/:orderId', tradingController.cancelPendingOrder);
 // ============ HISTORY ============
 router.get('/history', tradingController.getTradeHistory);
 router.get('/stats', tradingController.getTradeStats);
+router.get('/pending-order-history/:accountId', tradingController.getPendingOrderHistory);
 
 module.exports = router;
